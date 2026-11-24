@@ -1,0 +1,133 @@
+name: Graphify a repo
+
+# Builds a knowledge graph (graph.html, GRAPH_REPORT.md, graph.json) of any
+# GitHub repo using graphify installed from this fork. Code-only (tree-sitter AST),
+# so no API key is needed.
+#
+# Run it: Actions tab -> "Graphify a repo" -> Run workflow -> enter a repo.
+# Private repos: add a repo secret GH_PAT (a token with read access to them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo to graph (owner/name or full GitHub URL)"
+        required: true
+        default: "Sushiel13/AppStore"
+      branch:
+        description: "Branch (blank = repo default)"
+        required: false
+        default: ""
+      commit_graph:
+        description: "Also commit the output to graphs/<repo>/ in this fork"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: graphify-${{ github.event.inputs.repo }}
+  cancel-in-progress: false
+
+jobs:
+  graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this fork (graphify source)
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install graphify from this fork
+        run: |
+          uv tool install .
+          graphify --version
+
+      - name: Resolve target repo
+        id: target
+        env:
+          INPUT_REPO: ${{ github.event.inputs.repo }}
+        run: |
+          r="${INPUT_REPO%/}"
+          r="${r%.git}"
+          r="${r#https://github.com/}"
+          r="${r#http://github.com/}"
+          r="${r#github.com/}"
+          if ! [[ "$r" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Could not parse repo '$INPUT_REPO' (use owner/name)"; exit 1
+          fi
+          echo "slug=$r" >> "$GITHUB_OUTPUT"
+          echo "name=${r//\//__}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone target repo
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          BRANCH: ${{ github.event.inputs.branch }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            url="https://x-access-token:${GH_PAT}@github.com/${SLUG}.git"
+          else
+            url="https://github.com/${SLUG}.git"
+          fi
+          args=(--depth 1)
+          [ -n "$BRANCH" ] && args+=(--branch "$BRANCH")
+          GIT_LFS_SKIP_SMUDGE=1 git clone "${args[@]}" "$url" target
+          echo "Commit: $(git -C target rev-parse --short HEAD)"
+
+      - name: Build the graph (AST only, no LLM)
+        working-directory: target
+        run: |
+          graphify update .
+          ls -la graphify-out
+
+      - name: Write job summary
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          {
+            echo "## Graph of \`$SLUG\`"
+            echo
+            if [ -f target/graphify-out/GRAPH_REPORT.md ]; then
+              head -c 60000 target/graphify-out/GRAPH_REPORT.md
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload graph as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-${{ steps.target.outputs.name }}
+          path: |
+            target/graphify-out/graph.html
+            target/graphify-out/graph.json
+            target/graphify-out/GRAPH_REPORT.md
+          retention-days: 30
+
+      - name: Commit graph to graphs/<repo>/
+        if: ${{ github.event.inputs.commit_graph == 'true' }}
+        env:
+          NAME: ${{ steps.target.outputs.name }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          dest="graphs/$NAME"
+          mkdir -p "$dest"
+          cp target/graphify-out/graph.html target/graphify-out/graph.json "$dest"/
+          cp target/graphify-out/GRAPH_REPORT.md "$dest"/ 2>/dev/null || true
+          rm -rf target
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add "$dest"
+          if git diff --cached --quiet; then
+            echo "Graph unchanged, nothing to commit."; exit 0
+          fi
+          git commit -m "graph: update $SLUG"
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 5
+          done
+          echo "::error::Push failed after 3 attempts"; exit 1
